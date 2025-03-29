@@ -8,25 +8,40 @@
 #include <LiquidCrystal_I2C.h>
 #include <Wire.h>
 
+// Pin Sensor
+#define DHTPIN 17
+const int ammoniaSensorPin = 35;
+const int relayPin = 32;
+
 // Nama SSID default dan password untuk fallback
 const char* fallbackSSID = "karim";
 const char* fallbackPassword = "960929ka";
+
+// Reconnect wifi
+unsigned long lastWiFiAttempt = 0;
+const unsigned long wifiRetryInterval = 30000;  // 30 detik
+int wifiReconnectAttempts = 0;
+const int maxWiFiReconnectAttempts = 10;
+bool isAlreadyConnect = false;
+
 
 // HiveMQ MQTT Broker Configuration
 const char* mqtt_server = "499b37cd93464a848333539b957a57ef.s1.eu.hivemq.cloud";
 const int mqtt_port = 8883;
 const char* mqtt_user = "percobaan1";
 const char* mqtt_password = "Percobaan2024";
-const char* mqtt_relay_control_topic = "esp32/relay";  // Kontrol relay dari Discord
-const char* mqtt_relay_status_topic = "relay/notifications";
-const char* mqtt_sensor_data_topic = "sensor/data";
-const char* mqtt_wifi_topic = "sensor/wifi";
-const char* mqtt_ratio_topic = "sensor/ratio";
-const char* mqtt_relay_setting_topic = "relay/setting";
-const char* mqtt_ammonia_threshold_topic = "relay/ammonia";
+
+// MQTT topic and subtopic
+const char* mqtt_relay_control_topic = "esp32/relay";
 const char* mqtt_heartbeat_topic = "esp32/heartbeat";
 const char* mqtt_restart_topic = "esp32/restart";
 const char* mqtt_isonline_topic = "esp32/isonline";
+const char* mqtt_relay_status_topic = "relay/notifications";
+const char* mqtt_relay_setting_topic = "relay/setting";
+const char* mqtt_ammonia_threshold_topic = "relay/ammonia";
+const char* mqtt_sensor_data_topic = "sensor/data";
+const char* mqtt_wifi_topic = "sensor/wifi";
+const char* mqtt_voltage_mems_topic = "sensor/voltage";
 
 // Interval Publish Data ke MQTT
 unsigned long lastPublishTime = 0;            // Untuk pengiriman data MQTT
@@ -37,48 +52,43 @@ bool publishDefaultData = true;
 unsigned long previousMillisLCD = 0;
 const long intervalLCD = 1000;  // intervalLCD 1 detik
 
-// MQ-135 Konfigurasi
-float ratio;
-int RL = 20;
-float Vin = 5.0;
-float Ro = 6.31;
-float m = 0.4060;
-float a = 6.4835;
-const int MQ_sensor = 35;
+// MEMS NH3 Konfigurasi
+const float voltageInput = 5.0;
+const int numReadings = 10;
+float ppm = 0;
+float readings[numReadings];
+int readIndex = 0;
 float total = 0;
-float ppm;
+float average = 0;
 
 // DHT21 Konfigurasi
-#define DHTPIN 17      // DHT21 connected to pin 19
 #define DHTTYPE DHT21  // Define sensor type DHT21
 DHT dht(DHTPIN, DHTTYPE);
-float suhu_offset = -4.6;
-float kelembapan_offset = 17.0;
 float suhu;
-float kelembapan;
+int kelembapan;
 
 // Relay Konfigurasi
-const int relayPin = 32;
 bool relayActive = false;
 bool isManualMode = false;  // Menandakan apakah relay dalam mode manual
 bool toggleManualRelay = false;
 bool toggleRelay = false;
 String status_mode = "Otomatis";
 unsigned long lastRelayChange = 0;
-unsigned long relayOnDuration = 30000;   // 30 detik ON
-unsigned long relayOffDuration = 10000;  // 10 detik OFF
-unsigned long manualRelayDuration = 0;   // timer relay manual
+unsigned long relayOnDuration = 5000;       // 5 detik ON
+unsigned long relayOffDuration = 25200000;  // 7 jam OFF
+unsigned long manualRelayDuration = 0;      // timer relay manual
 unsigned long relayStartTime = 0;
 
 // Buzzer
 const int buzzerPin = 18;
 unsigned long buzzerStartTime = 0;
-unsigned long buzzerDuration = 500;
 bool toggleBuzzer = false;
+bool toggleBuzzerRelayAutoOn = false;
 bool buzzerOn = false;
 
+
 // Ambang batas amonia
-float ammonia_threshold = 25;
+float ammonia_threshold = 15;
 
 // Validasi mode offline/online
 bool isOnline = false;
@@ -93,6 +103,7 @@ bool isSettingAmmonia = false;
 bool notifIsOnline = false;
 bool isSettingRelayManualOn = false;
 bool isNotifTimerOn = false;
+bool isSetTimer = false;
 
 // Inisiasi arduino JSON
 StaticJsonDocument<200> data;
@@ -352,10 +363,14 @@ void connectToFallback() {
     lcd.setCursor(0, 1);
     lcd.print(fallbackSSID);
     lcd.setCursor(0, 2);
+    lcd.print("SSID: ");
+    lcd.print(WiFi.SSID());
+    lcd.setCursor(0, 3);
     lcd.print("IP: ");
     lcd.print(WiFi.localIP());
     Serial.println("\nFallback success!");
     isOnline = true;
+    isAlreadyConnect = true;
     delay(2000);
   } else {
     lcd.clear();
@@ -398,9 +413,13 @@ void setupWiFi() {
       lcd.setCursor(0, 0);
       lcd.print("WiFi Connected!");
       lcd.setCursor(0, 1);
+      lcd.print("SSID: ");
+      lcd.print(WiFi.SSID());
+      lcd.setCursor(0, 2);
       lcd.print("IP: ");
       lcd.print(WiFi.localIP());
       isOnline = true;
+      isAlreadyConnect = true;
       delay(5000);
     } else {
       // Jika gagal masuk ke mode AP
@@ -413,23 +432,39 @@ void setupWiFi() {
     createWiFiAP();
   }
 }
+
 // ----------------- Konfigurasi Wifi (END) -----------------
 
 // ----------------- Konfigurasi Sensor (START) -----------------
 // Fungsi membaca data dari sensor
 void handleData() {
-  float Vout = analogRead(MQ_sensor) * (Vin / 4096.0);  // Tegangan sensor
-  if (Vout < 0.1) Vout = 0.1;                           // Pencegahan pembagian 0
-  float Rs = (RL * Vin / Vout) - RL;
-  ratio = Ro / Rs;
-  ppm = pow(ratio * a, 1 / m);
+  // Reset total jika minus
+  if (total < 0) {
+    total = 0;
+    for (int i = 0; i < numReadings; i++) {
+      readings[i] = 0;
+    }
+  }
 
-  // Koreksi batas pembacaan
-  if (ppm < 10) ppm = 0;
-  if (ppm > 300) ppm = 300;
+  total = total - readings[readIndex];
+  int sensorValue = analogRead(ammoniaSensorPin);
+  float voltage = abs((sensorValue * voltageInput) / 4095.0);  // Gunakan abs() untuk nilai positif
+  readings[readIndex] = voltage;
+  total = total + voltage;
+  readIndex++;
+  if (readIndex >= numReadings) {
+    readIndex = 0;
+  }
 
-  float h = dht.readHumidity() + kelembapan_offset;
-  suhu = dht.readTemperature() + suhu_offset;
+  average = total / numReadings;
+  if (average < 0) average = 0;
+
+  ppm = (628.81 * average) + 0.857;
+  if (ppm < 1) ppm = 0;
+  if (ppm > 200) ppm = 200;
+
+  float h = dht.readHumidity();
+  suhu = dht.readTemperature();
   kelembapan = (h <= 99) ? h : 99.0;
   if (isnan(kelembapan) || isnan(suhu)) {
     Serial.println(F("Failed to read from DHT sensor!"));
@@ -439,12 +474,13 @@ void handleData() {
 // ----------------- Konfigurasi Sensor (END) -----------------
 
 // ----------------- Konfigurasi Buzzer (START) -----------------
-void buzzerActive(unsigned long currentTime) {
+void buzzerActive(unsigned long currentTime, unsigned long buzzerDuration = 500) {
   if (buzzerOn) {
     if (currentTime - buzzerStartTime >= buzzerDuration) {
       buzzerOn = false;
       digitalWrite(buzzerPin, LOW);
       toggleBuzzer = false;
+      toggleBuzzerRelayAutoOn = false;
     }
   } else {
     digitalWrite(buzzerPin, HIGH);
@@ -534,7 +570,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
       toggleManualRelay = false;
       manualRelayDuration = 0;
       publishRelayStatus("Relay OFF", "MANUAL");
-      publishRelaySetting("relay_on_manual", manualRelayDuration);
+      publishRelaySetting("timer_on", manualRelayDuration);
 
     } else if (command == "TIMER") {
       toggleBuzzer = true;
@@ -564,9 +600,9 @@ void callback(char* topic, byte* payload, unsigned int length) {
     } else if (command == "relay_off" && key == "begin") {
       relayOffDuration = duration;
       publishRelaySetting("relay_off", relayOffDuration);
-    } else if (command == "relay_on_manual" && key == "begin") {
+    } else if (command == "timer_on" && key == "begin") {
       manualRelayDuration = duration;
-      publishRelaySetting("relay_on_manual", manualRelayDuration);
+      publishRelaySetting("timer_on", manualRelayDuration);
     } else if (command == "relay_on" && key == "running") {
       relayOnDuration = duration;
       isSettingRelayOn = true;
@@ -577,11 +613,12 @@ void callback(char* topic, byte* payload, unsigned int length) {
       isSettingRelayOff = true;
       toggleBuzzer = true;
       publishRelaySetting("relay_off", relayOffDuration);
-    } else if (command == "relay_on_manual" && key == "running") {
+    } else if (command == "timer_on" && key == "running") {
       manualRelayDuration = duration;
       isSettingRelayManualOn = true;
       toggleBuzzer = true;
-      publishRelaySetting("relay_on_manual", manualRelayDuration);
+      isSetTimer = true;
+      publishRelaySetting("timer_on", manualRelayDuration);
     }
   }
 
@@ -674,7 +711,6 @@ void timerRelayOn(unsigned long currentTime) {
     relayStartTime = 0;
   }
 }
-
 // ----------------- Konfigurasi Timer Relay ON manual (END) -----------------
 
 // Manajemen relay otomatis
@@ -686,7 +722,7 @@ void manageRelay(unsigned long currentTime) {
     relayActive = true;
     digitalWrite(relayPin, HIGH);
     lastRelayChange = currentTime;
-    toggleBuzzer = true;
+    toggleBuzzerRelayAutoOn = true;
 
     // publish data json relay_mode
     if (isOnline) {
@@ -745,7 +781,7 @@ void publishBeginningData() {
 
   // Data setting timmer relay ON mode manual
   data.clear();
-  data["command"] = "relay_on_manual";
+  data["command"] = "timer_on";
   data["duration"] = manualRelayDuration;
   String outputJson4;
   serializeJson(data, outputJson4);
@@ -796,11 +832,100 @@ void publishSensorData() {
     Serial.println("Gagal mempublikasikan data wifi");
   }
   // Publikasi data Rs/Ro
-  if (client.publish(mqtt_ratio_topic, String(ratio).c_str())) {
-    Serial.println("Data Rs/Ro berhasil dipublikasikan");
+  if (client.publish(mqtt_voltage_mems_topic, String(average).c_str())) {
+    Serial.println("Data tegangan berhasil dipublikasikan");
   } else {
-    Serial.println("Gagal mempublikasikan data Rs/Ro");
+    Serial.println("Gagal mempublikasikan data tegangan");
   }
+}
+
+void tryReconnectWiFi(unsigned long currentMillis) {
+  // Cek apakah sudah online atau belum waktunya mencoba lagi
+  if (isOnline || currentMillis - lastWiFiAttempt < wifiRetryInterval) {
+    return;
+  }
+
+  // Cek apakah sudah mencapai batas percobaan
+  if (wifiReconnectAttempts >= maxWiFiReconnectAttempts) {
+    // Reset counter setelah beberapa waktu
+    if (currentMillis - lastWiFiAttempt >= wifiRetryInterval * 2) {
+      wifiReconnectAttempts = 0;
+    }
+    return;
+  }
+
+  // Catat waktu percobaan
+  lastWiFiAttempt = currentMillis;
+  wifiReconnectAttempts++;
+
+  // Tampilkan status di LCD
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Reconnecting WiFi");
+  lcd.setCursor(0, 1);
+  lcd.print("Attempt: ");
+  lcd.print(wifiReconnectAttempts);
+
+  // Ambil kredensial WiFi
+  preferences.begin("wifi-creds", true);
+  String savedSSID = preferences.getString("ssid", "");
+  String savedPassword = preferences.getString("password", "");
+  preferences.end();
+
+  if (savedSSID == "") {
+    return;  // Tidak ada kredensial tersimpan
+  }
+
+  // Coba hubungkan
+  WiFi.disconnect();
+  WiFi.mode(WIFI_STA);
+  if (savedPassword == "-") {
+    WiFi.begin(savedSSID.c_str());
+  } else {
+    WiFi.begin(savedSSID.c_str(), savedPassword.c_str());
+  }
+
+  // Tunggu beberapa detik tanpa blocking
+  unsigned long connectStartTime = millis();
+  while (millis() - connectStartTime < 10000) {  // Tunggu max 10 detik
+    if (WiFi.status() == WL_CONNECTED) {
+      buzzerAlert();
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("WiFi Connected!");
+      lcd.setCursor(0, 1);
+      lcd.print("SSID: ");
+      lcd.print(WiFi.SSID());
+      lcd.setCursor(0, 2);
+      lcd.print("IP: ");
+      lcd.print(WiFi.localIP());
+
+      isOnline = true;
+      wifiReconnectAttempts = 0;
+
+      // Inisialisasi MQTT jika belum
+      if (isOnline && !client.connected()) {
+        espClient.setInsecure();
+        client.setServer(mqtt_server, mqtt_port);
+        client.setCallback(callback);
+      }
+
+      delay(2000);  // Tampilkan pesan sebentar
+      lcd.clear();
+      return;
+    }
+    delay(100);  // Polling setiap 100ms
+    yield();     // Beri kesempatan ESP32 menangani tugas lain
+  }
+
+  // Jika gagal, tampilkan pesan
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("WiFi Connect Failed");
+  lcd.setCursor(0, 1);
+  lcd.print("Will retry in 30s");
+  delay(2000);
+  lcd.clear();
 }
 
 void notifLCD(unsigned long currentTime) {
@@ -816,6 +941,7 @@ void notifLCD(unsigned long currentTime) {
       isSettingAmmonia = false;
       notifIsOnline = false;
       isNotifTimerOn = false;
+      isSetTimer = false;
     }
   }
   // Tampilkan notifikasi jika ada dan tidak sedang menampilkan notif lain
@@ -872,6 +998,18 @@ void notifLCD(unsigned long currentTime) {
       lcd.print(manualRelayDuration / 1000);
       lcd.print(" s");
       notifStartTime = currentTime;
+    } else if (isSetTimer) {
+      isShowingNotif = true;
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Setting Berhasil");
+      lcd.setCursor(0, 1);
+      lcd.print("Durasi Timer Relay");
+      lcd.setCursor(0, 2);
+      lcd.print("Menjadi: ");
+      lcd.print(manualRelayDuration / 1000);
+      lcd.print(" s");
+      notifStartTime = currentTime;
     }
   }
 }
@@ -891,8 +1029,8 @@ void updateLCD() {
   }
   lcd.setCursor(0, 2);
   lcd.print("NH3  : ");
-  lcd.print(ppm);
-  lcd.print(" PPM   ");
+  lcd.print(ppm, 3);
+  lcd.print(" PPM  ");
   lcd.setCursor(0, 3);
   lcd.print("Suhu : ");
   lcd.print(suhu);
@@ -902,11 +1040,25 @@ void updateLCD() {
 
 void setup() {
   Serial.begin(115200);
+  Wire.begin();
   lcd.init();
   lcd.backlight();
 
+  // Inisialisasi array dengan 0
+  for (int i = 0; i < numReadings; i++) {
+    readings[i] = 0;
+  }
+
   // Inisiasi buzzer
   pinMode(buzzerPin, OUTPUT);
+
+  // Inisiasi relay
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(relayPin, LOW);
+  isManualMode = false;
+
+  // Inisiasi DHT21
+  dht.begin();
 
   // Inisiasi Wifi
   setupWiFi();
@@ -921,8 +1073,6 @@ void setup() {
   Serial.println("Web server started, waiting for requests...");
   lcd.clear();
 
-  // Inisiasi DHT21
-  dht.begin();
 
   // Inisiasi MQTT
   if (isOnline) {
@@ -931,14 +1081,14 @@ void setup() {
     client.setCallback(callback);
   }
 
-  // Inisiasi relay
-  pinMode(relayPin, OUTPUT);
-  digitalWrite(relayPin, LOW);
-  isManualMode = false;
 }
 
 void loop() {
   unsigned long currentMillis = millis();
+
+  if (!isOnline && !WiFi.softAPgetStationNum() && isAlreadyConnect) {
+    tryReconnectWiFi(currentMillis);
+  }
 
   // Webserver Wifi
   server.handleClient();
@@ -950,14 +1100,11 @@ void loop() {
   }
 
   // Kontrol relay
-  if (!isManualMode) {
-    manageRelay(currentMillis);
-  }
+  if (!isManualMode) manageRelay(currentMillis);
 
   // Timer Relay Manual - cek sebelum manageRelay
-  if (toggleManualRelay) {
-    timerRelayOn(currentMillis);
-  }
+  if (toggleManualRelay) timerRelayOn(currentMillis);
+
 
   // Publish Data Default Sistem Hanya Sekali ke MQTT
   if (isOnline && publishDefaultData) {
@@ -969,9 +1116,7 @@ void loop() {
   if (currentMillis - previousMillisLCD >= intervalLCD) {
     previousMillisLCD = currentMillis;
     handleData();
-    if (!isShowingNotif) {
-      updateLCD();
-    }
+    if (!isShowingNotif) updateLCD();
   }
 
   // Publish data ke MQTT setiap 15 detik sekali
@@ -985,7 +1130,6 @@ void loop() {
   notifLCD(currentMillis);
 
   // Buzzer
-  if (toggleBuzzer) {
-    buzzerActive(currentMillis);
-  }
+  if (toggleBuzzer) buzzerActive(currentMillis);
+  if (toggleBuzzerRelayAutoOn) buzzerActive(currentMillis, 3000);
 }
